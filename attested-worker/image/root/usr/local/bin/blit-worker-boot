@@ -1,0 +1,161 @@
+#!/bin/bash
+# Attested worker boot: scratch, wait for this instance's job ticket, fetch the
+# compute commit it names and MEASURE it into PCR14; on a solver machine, open
+# the engine root (its own verity-checked volume) and MEASURE its root hash
+# into PCR15 before mounting it. Only then start the worker or the service,
+# which are part of this image (/opt/blit) and run on its own Python. Nothing
+# of the commit or the engine root runs here: only in the worker's sandbox,
+# unprivileged.
+set -u
+shutdown -h +30                                  # dead-man until the run takes over
+D=/run/blit; mkdir -p -m 700 "$D"; cd "$D"
+BUCKET=blitai-dev-bucket
+# Steps only, never project data: uploaded as it grows, so a machine that
+# hangs before its ticket still says where (attested/boot/<instance>.log).
+log() {
+  echo "$(date -u +%FT%TZ) $*" >> "$D/boot.log"
+  [ -n "${IID:-}" ] && aws s3 cp --region us-east-1 --only-show-errors "$D/boot.log" "s3://$BUCKET/attested/boot/$IID.log" >/dev/null 2>&1 &
+}
+IID=""; ARN=""
+for i in $(seq 1 30); do   # the metadata service can lag the network at boot
+  ID=$(python3 -c '
+import urllib.request as u
+t = u.urlopen(u.Request("http://169.254.169.254/latest/api/token", method="PUT",
+    headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}), timeout=5).read().decode()
+import json
+d = json.loads(u.urlopen(u.Request("http://169.254.169.254/latest/dynamic/instance-identity/document",
+    headers={"X-aws-ec2-metadata-token": t}), timeout=5).read())
+print(d["instanceId"], "arn:aws:ec2:%s:%s:instance/%s" % (d["region"], d["accountId"], d["instanceId"]))' 2>/dev/null) &&
+    read -r IID ARN <<< "$ID" && [ -n "$IID" ] && [ -n "$ARN" ] && break
+  sleep 2
+done
+log "instance $IID"
+
+# Scratch: instance storage, encrypted with a key only this kernel holds.
+DEV=$(ls /dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage_* 2>/dev/null | grep -v -- -part | head -1)
+mkdir -p /scratch
+if [ -n "$DEV" ]; then
+  cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512 --key-file /dev/urandom "$DEV" scratch \
+    && mkfs.xfs -q -f /dev/mapper/scratch && mount /dev/mapper/scratch /scratch
+else
+  mount -t tmpfs -o size=75% tmpfs /scratch     # no instance storage: RAM
+fi
+log "scratch: ${DEV:-tmpfs}"
+modprobe nvidia; modprobe nvidia-uvm; nvidia-modprobe -u -c=0
+log "gpu driver: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
+nvidia-ctk cdi generate --format=json --output=/run/nvidia-cdi.json >/dev/null 2>&1
+
+# The job ticket: written by the run Lambda for this instance, at its ARN (the
+# one ticket this machine's role may read).
+for i in $(seq 1 300); do
+  aws s3 cp --region us-east-1 --only-show-errors "s3://$BUCKET/attested/tickets/$ARN" "$D/ticket.json" 2>/dev/null && break
+  sleep 2
+done
+[ -s "$D/ticket.json" ] || { log "no ticket"; sleep 5; poweroff; exit 0; }
+log "ticket"
+RUN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"])' "$D/ticket.json")
+COMMIT=$(python3 -c 'import json,sys,re; c=json.load(open(sys.argv[1]))["commit"]; assert re.fullmatch("[0-9a-f]{40}", c); print(c)' "$D/ticket.json") || { log "bad ticket"; poweroff; exit 0; }
+ROLE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("role",""))' "$D/ticket.json")
+up() { aws s3 cp --region us-east-1 --only-show-errors "$1" "s3://$BUCKET/attested/$RUN/$IID/$2" 2>/dev/null; }
+
+# Fetch the code with this image's git and ssh, then measure it before
+# anything of it runs.
+CODE=/scratch/compute
+aws secretsmanager get-secret-value --region us-east-1 --secret-id blit/compute-deploy-key --query SecretString --output text > "$D/deploy" 2>/dev/null
+chmod 600 "$D/deploy"
+echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$D/known_github"
+( set -e; export HOME=/root GIT_SSH_COMMAND="ssh -i $D/deploy -o IdentitiesOnly=yes -o UserKnownHostsFile=$D/known_github -o StrictHostKeyChecking=yes"
+  rm -rf "$CODE"; git init -q "$CODE"; cd "$CODE"
+  git fetch -q --depth 1 git@github.com:blitai/compute.git "$COMMIT"; git -c advice.detachedHead=false checkout -q FETCH_HEAD
+  test "$(git rev-parse HEAD)" = "$COMMIT" ) >> "$D/boot.log" 2>&1
+OK=$?; rm -f "$D/deploy"
+[ $OK = 0 ] || { log "fetch failed"; up "$D/boot.log" boot.log; poweroff; exit 0; }
+chmod -R a+rX "$CODE"
+M=$(printf 'blit/compute/v1:%s' "$COMMIT" | sha384sum | cut -d' ' -f1)
+tpm2_pcrextend 14:sha384=$M >> "$D/boot.log" 2>&1 || { log "measure failed"; poweroff; exit 0; }
+log "compute $COMMIT measured into PCR14"
+up "$D/boot.log" boot.log
+
+if [ "$ROLE" = service ]; then
+  # The processing service (attested/service.py): the Lambda images of
+  # the ticket's manifest, MEASURED into PCR13 before any is pulled, each
+  # pulled by digest and run under the pinned runtime emulator on 127.0.0.1.
+  MF=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["manifest"], sort_keys=True, separators=(",", ":")))' "$D/ticket.json")
+  MH=$(printf '%s' "$MF" | sha384sum | cut -d' ' -f1)
+  tpm2_pcrextend 13:sha384=$MH >> "$D/boot.log" 2>&1 || { log "manifest measure failed"; poweroff; exit 0; }
+  log "manifest $MH measured into PCR13"
+  mkdir -p /etc/docker /scratch/docker
+  echo '{"data-root": "/scratch/docker", "log-driver": "none"}' > /etc/docker/daemon.json
+  systemctl start docker
+  REG=$(printf '%s' "$MF" | python3 -c 'import json,sys; print(next(iter(json.load(sys.stdin).values())).split("/")[0])')
+  aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "$REG" >/dev/null 2>&1
+  FNS="$D/functions"; mkdir -p "$FNS"
+  for FN in $(printf '%s' "$MF" | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin))))'); do
+    IMG=$(printf '%s' "$MF" | python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$FN")
+    case "$IMG" in *@sha256:*) ;; *) log "image $FN not pinned by digest"; poweroff; exit 0;; esac
+    docker pull -q "$IMG" >/dev/null 2>&1 || { log "pull $FN failed"; poweroff; exit 0; }
+    docker inspect --format '{{json .Config}}' "$IMG" > "$FNS/$FN" || { log "inspect $FN failed"; poweroff; exit 0; }
+    printf '%s' "$IMG" > "$FNS/$FN.image"
+  done
+  FUNCTIONS=$(python3 -c '
+import json,sys,os
+d=sys.argv[1]; out={}
+for f in os.listdir(d):
+    if not f.endswith(".image"):
+        c=json.load(open(os.path.join(d,f))); out[f]={"image":open(os.path.join(d,f+".image")).read(),"command":(c.get("Entrypoint") or [])+(c.get("Cmd") or [])}
+print(json.dumps(out,separators=(",",":")))' "$FNS")
+  rm -rf "$FNS"
+  mkdir -p -m 711 /run/blit-svc
+  QUEUE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["queue"])' "$D/ticket.json")
+  log "service images ready"
+  up "$D/boot.log" boot.log
+  env -i HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 PYTHONIOENCODING=utf-8 \
+    BLIT_SVC_QUEUE="$QUEUE" BLIT_SVC_FUNCTIONS="$FUNCTIONS" BLIT_SVC_MANIFEST_SHA384="$MH" BLIT_SVC_INSTANCE="$IID" \
+    python3 /opt/blit/attested/service.py > "$D/worker.log" 2>&1 &
+  W=$!
+else
+  # The engine root: the image's second volume, an erofs filesystem under
+  # dm-verity. Its root hash, read from the volume's last block, is MEASURED
+  # into PCR15 before the volume is opened; dm-verity then refuses any block
+  # that does not match it, so PCR15 names exactly what can be read.
+  ENG=$(lsblk -dnpo NAME,MODEL | awk '/Amazon Elastic Block Store/ {print $1}' |
+        while read -r d; do [ "$(lsblk -nro TYPE "$d" | grep -c part)" = 0 ] && echo "$d"; done | head -1)
+  [ -n "$ENG" ] || { log "no engine volume"; poweroff; exit 0; }
+  SZ=$(blockdev --getsize64 "$ENG")
+  read -r RH HO <<< "$(dd if="$ENG" bs=4096 skip=$((SZ / 4096 - 1)) count=1 status=none | tr -d '\0' | python3 -c '
+import json,sys,re
+t=json.load(sys.stdin); h=t["root_hash"]; o=int(t["hash_offset"])
+assert t["v"] == 1 and re.fullmatch("[0-9a-f]{64}", h) and o > 0 and o % 4096 == 0
+print(h, o)')" || { log "bad engine volume"; poweroff; exit 0; }
+  [ -n "${RH:-}" ] || { log "bad engine volume"; poweroff; exit 0; }
+  M=$(printf 'blit/engine/v1:%s' "$RH" | sha384sum | cut -d' ' -f1)
+  tpm2_pcrextend 15:sha384=$M >> "$D/boot.log" 2>&1 || { log "engine measure failed"; poweroff; exit 0; }
+  log "engine root $RH measured into PCR15"
+  mkdir -p /run/engine-ro /scratch/upper /scratch/work /run/engine
+  veritysetup open "$ENG" blit-engine "$ENG" "$RH" --hash-offset="$HO" >> "$D/boot.log" 2>&1 &&
+    mount -t erofs -o ro,nodev /dev/mapper/blit-engine /run/engine-ro &&
+    mount -t overlay overlay -o lowerdir=/run/engine-ro,upperdir=/scratch/upper,workdir=/scratch/work /run/engine ||
+    { log "engine mount failed"; up "$D/boot.log" boot.log; poweroff; exit 0; }
+
+  # The engine's own mount namespace: host driver files, this image's
+  # programs read-only at /opt/blit, the fetched commit at the usual path.
+  mkdir -p /run/engine/opt/blit /run/engine/home/ubuntu/compute
+  unshare -m --propagation private bash -c '
+    mount -t proc proc /run/engine/proc && mount --rbind /sys /run/engine/sys && mount --rbind /dev /run/engine/dev &&
+    mount --bind /usr/local/lib/blit /run/engine/opt/blit && mount -o remount,bind,ro /run/engine/opt/blit &&
+    mount --bind '"$CODE"' /run/engine/home/ubuntu/compute &&
+    exec sleep infinity' </dev/null >/dev/null 2>&1 &
+  sleep 2; NS=$(pgrep -f -n '^sleep infinity')
+  nsenter -t $NS -m /usr/local/bin/blit-cdi-apply /run/engine /run/nvidia-cdi.json >> "$D/boot.log" 2>&1
+  log "engine root ready"
+  up "$D/boot.log" boot.log
+  # Run it, in that namespace, on this image's Python. The dead-man stays
+  # armed while the worker lives (24 h at most).
+  nsenter -t $NS -m env -i HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+    PYTHONIOENCODING=utf-8 python3 /opt/blit/attested/worker.py --ticket "$D/ticket.json" --instance "$IID" > "$D/worker.log" 2>&1 &
+  W=$!
+fi
+( n=0; while kill -0 $W 2>/dev/null && [ $n -lt 144 ]; do shutdown -c; shutdown -h +30; n=$((n+1)); sleep 600; done ) >/dev/null 2>&1 &
+wait $W; log "worker exit $?"
+up "$D/boot.log" boot.log   # not worker.log: an error there could quote project data
+poweroff

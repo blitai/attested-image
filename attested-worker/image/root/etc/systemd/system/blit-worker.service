@@ -1,0 +1,11 @@
+[Unit]
+Description=Blit attested worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/blit-worker-boot
+
+[Install]
+WantedBy=multi-user.target

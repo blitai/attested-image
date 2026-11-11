@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Apply NVIDIA's CDI spec (all GPUs) to a chroot, inside the current mount
+namespace: bind the host's driver files read-only at their container paths,
+create the spec's symlinks, register its library folders, run ldconfig."""
+import json, os, subprocess, sys
+
+root, spec_path = sys.argv[1], sys.argv[2]
+spec = json.load(open(spec_path))
+edits = [spec.get("containerEdits", {})] + [d.get("containerEdits", {}) for d in spec.get("devices", []) if d.get("name") == "all"]
+inside = lambda p: os.path.join(root, p.lstrip("/"))
+folders, links, done = set(), [], set()
+for e in edits:
+    for m in e.get("mounts", []) or []:
+        src, dst = m["hostPath"], inside(m["containerPath"])
+        if dst in done or not os.path.exists(src):
+            continue
+        if os.path.isdir(src):
+            os.makedirs(dst, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if not os.path.lexists(dst):
+                open(dst, "a").close()
+        subprocess.run(["mount", "--bind", src, dst], check=True)
+        subprocess.run(["mount", "-o", "remount,bind,ro", dst], check=True)
+        done.add(dst)
+    for h in e.get("hooks", []) or []:
+        args = h.get("args", [])
+        if "create-symlinks" in args:
+            links += [a.split("=", 1)[1] for a in args if a.startswith("--link=")]
+            links += [args[i + 1] for i, a in enumerate(args) if a == "--link"]
+        if "update-ldcache" in args:
+            folders |= {a.split("=", 1)[1] for a in args if a.startswith("--folder=")}
+            folders |= {args[i + 1] for i, a in enumerate(args) if a == "--folder"}
+for link in links:
+    target, path = link.split("::")
+    p = inside(path)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    if not os.path.lexists(p):
+        os.symlink(target, p)
+with open(inside("/etc/ld.so.conf.d/000-nvidia-host.conf"), "w") as f:
+    f.write("\n".join(sorted(folders)) + "\n")
+subprocess.run(["ldconfig", "-r", root], check=True)   # this image's ldconfig: nothing of the root runs
+print("mounted %d files, %d links, folders %s" % (len(done), len(links), sorted(folders)))

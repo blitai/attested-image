@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<image schemaversion="7.5" name="al2023-attestable-image-example">
+    <description type="system">
+        <author>Amazon Linux</author>
+        <contact>https://aws.amazon.com/linux/amazon-linux-2023/</contact>
+        <specification>AL2023 Attestable Image Example</specification>
+        <license>Apache License 2.0</license>
+    </description>
+    <preferences>
+        <version>1.0.0</version>
+        <packagemanager>dnf</packagemanager>
+        <locale>en_US</locale>
+        <keytable>us</keytable>
+        <timezone>UTC</timezone>
+        <rpm-check-signatures>true</rpm-check-signatures>
+        <type
+            image="oem"
+            filesystem="xfs"
+            kernelcmdline="console=ttyS0 rd.shell=0 systemd.getty_auto=false rd.kiwi.verity_options=panic-on-corruption"
+            firmware="uefi"
+            overlayroot="true"
+            overlayroot_write_partition="false"
+            overlayroot_readonly_filesystem="erofs"
+            overlayroot_readonly_partsize="8192"
+            erofscompression="lz4hc,level=12"
+            eficsm="false"
+            verity_blocks="all"
+            bootpartition="false"
+            efipartsize="200"
+            editbootinstall="edit_boot_install.sh">
+        <oemconfig>
+            <oem-resize>false</oem-resize>
+        </oemconfig>
+        <bootloader name="systemd_boot" timeout="0"/>
+        <initrd action="setup">
+            <dracut uefi="true"/>
+        </initrd>
+        <size unit="G">12</size>
+        </type>
+    </preferences>
+
+    <!-- Both repositories are pinned to one snapshot each (a guid URL never
+         changes), so a rebuild installs the same packages; build.sh records
+         them. Move a pin deliberately, with the image it produces. -->
+    <repository priority="2" package_gpgcheck="true" customize="add-gpg-key.sh">
+            <source path="https://cdn.amazonlinux.com/al2023/core/guids/0d08b70774897c2bb6edd688009cb160ffc4e4afb06ced01555d6eee2ee221d7/x86_64/"/>
+    </repository>
+
+    <repository alias="amazonlinux-nvidia" priority="3" package_gpgcheck="true" customize="add-nvidia-key.sh">
+            <source path="https://al2023-repos-us-east-1-de612dc2.s3.dualstack.us-east-1.amazonaws.com/nvidia/guids/e4b1e0fe5a88f37baa6e4577f2184dcdbb9b9fb218511547217b23fb0b23e943/x86_64/"/>
+    </repository>
+
+    <packages type="image">
+        <!-- Use ami-minimal-kernel6.12 for kernel6.12 images -->
+        <namedCollection name="core"/>
+        <namedCollection name="ami-minimal-kernel6.12"/>
+        <package name="pciutils"/>
+        <package name="gzip"/>
+        <package name="awscli"/>
+        <package name="veritysetup"/>
+        <package name="systemd-boot"/>
+        <package name="tar"/>
+        <package name="zram-generator"/>
+        <package name="zram-generator-defaults"/>
+        <package name="cryptsetup"/>
+        <package name="dracut-kiwi-verity"/>
+        <package name="dracut-kiwi-overlay"/>
+        <package name="aws-nitro-tpm-tools"/>
+        <package name="systemd-resolved"/>
+        <package name="amazon-chrony-config"/>
+        <package name="binutils"/>
+        <package name="tpm2-tools"/>
+        <package name="xfsprogs"/>
+        <package name="util-linux"/>
+        <package name="openssl"/>
+        <package name="python3"/>
+        <!-- The worker, broker and service run on this image's own Python
+             (never the engine root's), and fetch the commit with its git. -->
+        <package name="python3-boto3"/>
+        <package name="python3-cryptography"/>
+        <package name="python3-certifi"/>
+        <package name="git-core"/>
+        <package name="openssh-clients"/>
+        <package name="kernel6.12-devel"/>
+        <package name="dkms"/>
+        <package name="gcc"/>
+        <package name="make"/>
+        <package name="kmod-nvidia-open-dkms"/>
+        <package name="nvidia-driver-cuda"/>
+        <package name="nvidia-container-toolkit"/>
+        <package name="docker"/>
+        <!-- Don't install these packages -->
+        <ignore name="ec2-hibinit-agent"/>
+        <ignore name="grubby"/>
+        <ignore name="grub2-pc-modules"/>
+        <ignore name="grub2-tools"/>
+        <ignore name="grub2-efi-aa64-ec2"/>
+        <ignore name="grub2-efi-aa64"/>
+        <ignore name="grub2-efi-aa64-modules"/>
+        <ignore name="grub2-efi-x64-ec2"/>
+        <ignore name="grub2-efi-x64"/>
+        <ignore name="grub2-efi-x64-modules"/>
+        <ignore name="firewalld"/>
+        <ignore name="amazon-linux-repo-s3"/>
+        <ignore name="amazon-linux-repo-cdn"/>
+        <!-- Remove operator access by not installing these packages -->
+        <ignore name="openssh-server"/>
+        <ignore name="amazon-ssm-agent"/>
+        <ignore name="cloud-init"/>
+        <ignore name="cloud-init-cfg-ec2"/>
+        <ignore name="update-motd" />
+        <ignore name="ec2-instance-connect"/>
+    </packages>
+    <packages type="bootstrap">
+        <package name="system-release"/>
+        <package name="dnf"/>
+        <package name="nvidia-release"/>
+        <!-- Ignoring these packages forces the use of the minimal versions -->
+        <ignore name="libcurl"/>
+        <ignore name="curl"/>
+        <ignore name="gnupg2"/>
+    </packages>
+</image>

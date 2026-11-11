@@ -1,0 +1,13 @@
+#!/bin/bash  
+sed -i 's|/boot/efi vfat defaults|/boot/efi vfat ro,nosuid,nodev,noexec,noatime|g' /etc/fstab
+
+# Last step before the root filesystem is made: drop what differs from one
+# build of the same commit to the next (logs, caches, a random seed).
+rm -f /var/lib/systemd/random-seed /var/cache/ldconfig/aux-cache /var/log/dnf*.log /var/log/hawkey.log /var/lib/dnf/history.sqlite* /var/lib/dkms/post_transaction.log
+rm -rf /var/lib/dkms/*/*/*/*/log
+[ -f /dev/kmsg ] && rm -f /dev/kmsg
+# The package database records install times. The image keeps a sorted list
+# instead, and the database waits in /run (left out of the image) until
+# edit_boot_install.sh puts it back for kiwi's package report.
+rpm -qa --qf '%{NEVRA} %{SHA256HEADER}\n' | LC_ALL=C sort > /usr/share/blit-packages.txt
+mkdir -p /run/rpmdb-hold && mv /var/lib/rpm/* /run/rpmdb-hold/
