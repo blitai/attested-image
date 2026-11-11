@@ -47,7 +47,8 @@ from blitcrypto.attest import (CODE_PCR, ENGINE_PCR, AttestationError, _cbor_dec
                                verify_attestation, wrap_for_instance)
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: E402
 
-BUCKET = "blitai-dev-bucket"
+# Where this machine's files live: from the instance's launch settings (blit-worker-boot).
+BUCKET = os.environ["BLIT_BUCKET"]
 KEY_WAIT_S = 15 * 60
 KEY_POLL_S = 0.5     # the key arrives seconds after the document; a run starts that much sooner
 PEER_WAIT_S = 20 * 60

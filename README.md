@@ -30,6 +30,14 @@ The published values are in
 one is also recorded in Sigstore's public transparency log. To check the log
 entries, use [`verify.js`](https://www.blit.ai/attested-log/verify.js).
 
+One input isn't measured: the launch settings in the instance's user data.
+They name the storage bucket for the machine's encrypted files and the two
+secrets it reads (the key that fetches the solver commit, and the AI model
+provider's API key). The boot script accepts only plain names and runs
+nothing from them (`blit-worker-boot`). They decide where encrypted files go,
+not what the machine trusts: the project key is still sealed to the measured
+machine, and the solver commit is still measured into PCR14.
+
 ## What runs with your key, and what doesn't
 
 The worker, the broker and the processing service hold the key. Their code is

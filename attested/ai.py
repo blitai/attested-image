@@ -32,13 +32,14 @@ import uuid
 import boto3
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-BUCKET = "blitai-dev-bucket"
+# Where this machine's files live: from the instance's launch settings (blit-worker-boot).
+BUCKET = os.environ["BLIT_BUCKET"]
 REGION = "us-east-1"
 API_HOST = "api.anthropic.com"
 API_VERSION = "2023-06-01"
 FILES_BETA = "files-api-2025-04-14"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
-KEY_SECRET = "blit/anthropic-api-key"
+KEY_SECRET = os.environ["BLIT_AI_KEY_SECRET"]  # the model provider's API key, by name
 # As the proxy: the models and server tools the frontend uses, unless the
 # relay passes its (environment-configured) lists.
 DEFAULT_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"]

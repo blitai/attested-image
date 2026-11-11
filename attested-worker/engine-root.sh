@@ -1,5 +1,9 @@
 set -e
 R=/root/engroot
+# From empty: rsync --delete keeps what it excludes, so a second run over an
+# old root would differ from a first.
+if findmnt -rno TARGET | grep -q "^$R/"; then echo "something is mounted under $R"; exit 1; fi
+rm -rf $R
 rsync -aHA --numeric-ids --delete \
   --exclude=/boot --exclude=/usr/lib/modules --exclude=/lib/modules --exclude=/usr/src \
   --exclude=/snap --exclude=/var/lib/snapd --exclude=/var/snap --exclude="/var/cache/*" --exclude="/var/log/*" \
@@ -11,12 +15,19 @@ rsync -aHA --numeric-ids --delete \
   /mnt/eng/ $R/
 for d in proc sys dev; do mkdir -p $R/$d; done
 mount -t proc proc $R/proc; mount --rbind /dev $R/dev; mount --make-rslave $R/dev; mount --rbind /sys $R/sys; mount --make-rslave $R/sys
-trap 'for m in dev sys proc; do umount -R -l "$R/$m" 2>/dev/null; done; true' EXIT
+trap 'for m in dev sys proc; do umount -R -l "$R/$m" 2>/dev/null || true; done' EXIT
 PKGS=$(chroot $R dpkg -l | awk '/^ii/ && /nvidia|libnvidia|xserver-xorg-video-nvidia|screen-resolution-extra/ {print $2}')
 chroot $R env DEBIAN_FRONTEND=noninteractive dpkg --purge --force-depends $PKGS openssh-server cloud-init ec2-instance-connect >/tmp/purge.log 2>&1 || tail -5 /tmp/purge.log
 # What the purge leaves that differs from one run to the next: its log (dated
-# lines) and ldconfig's aux-cache (inode numbers and times).
-rm -rf $R/var/log/* $R/var/cache/ldconfig/aux-cache
+# lines), ldconfig's aux-cache (inode numbers and times) and man-db's index.
+rm -rf $R/var/log/* $R/var/cache/ldconfig/aux-cache $R/var/cache/man
+for m in dev sys proc; do umount -R -l "$R/$m"; done
+# What this script changed carries today's time, which mkfs.erofs keeps when
+# it is older than the build's commit: pin it to the newest time on the
+# source disk, so the root depends on the snapshot alone, not on when this ran
+# (after the unmounts: else the host's /dev, /sys and /proc get it instead).
+T=$(find /mnt/eng -xdev -printf '%T@\n' | sort -n | tail -1 | cut -d. -f1)
+find $R -xdev -newermt "@$T" -exec touch -h -d "@$T" {} +
 echo "nvidia libs left: $(ls $R/usr/lib/x86_64-linux-gnu | grep -c 'libcuda\|libnvidia' || true)"
 du -xsh $R
 # The import check runs on a throwaway overlay: importing the PDF and plotting

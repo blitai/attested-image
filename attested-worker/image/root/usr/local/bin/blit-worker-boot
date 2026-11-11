@@ -9,7 +9,6 @@
 set -u
 shutdown -h +30                                  # dead-man until the run takes over
 D=/run/blit; mkdir -p -m 700 "$D"; cd "$D"
-BUCKET=blitai-dev-bucket
 # Steps only, never project data: uploaded as it grows, so a machine that
 # hangs before its ticket still says where (attested/boot/<instance>.log).
 log() {
@@ -29,6 +28,20 @@ print(d["instanceId"], "arn:aws:ec2:%s:%s:instance/%s" % (d["region"], d["accoun
     read -r IID ARN <<< "$ID" && [ -n "$IID" ] && [ -n "$ARN" ] && break
   sleep 2
 done
+# Launch settings, from the instance's user data (nothing here runs it): where
+# this machine's files live and which secrets it reads. Names only, each
+# checked against a strict pattern; they say where, never what is trusted.
+read -r BUCKET DEPLOY_SECRET AI_SECRET <<< "$(python3 -c '
+import urllib.request as u, json, re
+t = u.urlopen(u.Request("http://169.254.169.254/latest/api/token", method="PUT",
+    headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}), timeout=5).read().decode()
+s = json.loads(u.urlopen(u.Request("http://169.254.169.254/latest/user-data",
+    headers={"X-aws-ec2-metadata-token": t}), timeout=5).read())
+b, k, a = s["bucket"], s["deploy_key_secret"], s["ai_key_secret"]
+assert s["v"] == 1 and re.fullmatch("[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", b)
+assert all(re.fullmatch("[A-Za-z0-9/_+=.@-]{1,256}", x) for x in (k, a))
+print(b, k, a)' 2>/dev/null)"
+[ -n "${AI_SECRET:-}" ] || { echo "no launch settings" >> "$D/boot.log"; poweroff; exit 0; }
 log "instance $IID"
 
 # Scratch: instance storage, encrypted with a key only this kernel holds.
@@ -61,7 +74,7 @@ up() { aws s3 cp --region us-east-1 --only-show-errors "$1" "s3://$BUCKET/attest
 # Fetch the code with this image's git and ssh, then measure it before
 # anything of it runs.
 CODE=/scratch/compute
-aws secretsmanager get-secret-value --region us-east-1 --secret-id blit/compute-deploy-key --query SecretString --output text > "$D/deploy" 2>/dev/null
+aws secretsmanager get-secret-value --region us-east-1 --secret-id "$DEPLOY_SECRET" --query SecretString --output text > "$D/deploy" 2>/dev/null
 chmod 600 "$D/deploy"
 echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$D/known_github"
 ( set -e; export HOME=/root GIT_SSH_COMMAND="ssh -i $D/deploy -o IdentitiesOnly=yes -o UserKnownHostsFile=$D/known_github -o StrictHostKeyChecking=yes"
@@ -110,7 +123,7 @@ print(json.dumps(out,separators=(",",":")))' "$FNS")
   log "service images ready"
   up "$D/boot.log" boot.log
   env -i HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 PYTHONIOENCODING=utf-8 \
-    BLIT_SVC_QUEUE="$QUEUE" BLIT_SVC_FUNCTIONS="$FUNCTIONS" BLIT_SVC_MANIFEST_SHA384="$MH" BLIT_SVC_INSTANCE="$IID" \
+    BLIT_BUCKET="$BUCKET" BLIT_AI_KEY_SECRET="$AI_SECRET" BLIT_SVC_QUEUE="$QUEUE" BLIT_SVC_FUNCTIONS="$FUNCTIONS" BLIT_SVC_MANIFEST_SHA384="$MH" BLIT_SVC_INSTANCE="$IID" \
     python3 /opt/blit/attested/service.py > "$D/worker.log" 2>&1 &
   W=$!
 else
@@ -152,7 +165,7 @@ print(h, o)')" || { log "bad engine volume"; poweroff; exit 0; }
   # Run it, in that namespace, on this image's Python. The dead-man stays
   # armed while the worker lives (24 h at most).
   nsenter -t $NS -m env -i HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
-    PYTHONIOENCODING=utf-8 python3 /opt/blit/attested/worker.py --ticket "$D/ticket.json" --instance "$IID" > "$D/worker.log" 2>&1 &
+    PYTHONIOENCODING=utf-8 BLIT_BUCKET="$BUCKET" python3 /opt/blit/attested/worker.py --ticket "$D/ticket.json" --instance "$IID" > "$D/worker.log" 2>&1 &
   W=$!
 fi
 ( n=0; while kill -0 $W 2>/dev/null && [ $n -lt 144 ]; do shutdown -c; shutdown -h +30; n=$((n+1)); sleep 600; done ) >/dev/null 2>&1 &

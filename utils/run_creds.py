@@ -19,7 +19,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONF = os.path.join(HERE, "run_creds.conf")
 WORKER_PATHS = ("/home/ubuntu/compute/utils",   # where workers check compute out
                 "/opt/blit/utils")              # the attested image's own copy
-BUCKET = "blitai-dev-bucket"
+# The attested image's boot script names the bucket in the environment; the
+# other workers take it from the compute checkout's settings.
+BUCKET = os.environ.get("BLIT_BUCKET") or None
 IMDS = "http://169.254.169.254/latest"
 
 
@@ -54,8 +56,12 @@ def main():
                       aws_secret_access_key=inst["SecretAccessKey"], aws_session_token=inst["Token"])
     arn = f"arn:aws:ec2:{doc['region']}:{doc['accountId']}:instance/{doc['instanceId']}"
     from botocore.exceptions import ClientError
+    bucket = BUCKET
+    if bucket is None:
+        sys.path.insert(0, os.path.dirname(HERE))
+        from config.constants import BUCKET_NAME as bucket
     try:
-        run = json.loads(s3.get_object(Bucket=BUCKET, Key=f"creds/{arn}")["Body"].read())
+        run = json.loads(s3.get_object(Bucket=bucket, Key=f"creds/{arn}")["Body"].read())
         out = {"Version": 1, **{k: run[k] for k in ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration")}}
     except ClientError as e:
         # None left for this instance (without ListBucket a missing key reads as AccessDenied)

@@ -45,7 +45,8 @@ from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: E402
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF  # noqa: E402
 
-BUCKET = "blitai-dev-bucket"
+# Where this machine's files live: from the instance's launch settings (blit-worker-boot).
+BUCKET = os.environ["BLIT_BUCKET"]
 REGION = "us-east-1"
 _ID_OK = set("abcdefghijklmnopqrstuvwxyz0123456789-")
 _RESOURCE = re.compile(r"^/[a-z0-9_]{1,64}$")
